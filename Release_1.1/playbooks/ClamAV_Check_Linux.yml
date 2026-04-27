@@ -1,98 +1,142 @@
 ---
 # --------------------------------------------------------------
-# Playbook: clamav_audit.yml
-# Purpose : Run freshclam --version on each host, collect the
-#           engine and signature information, add a UTC timestamp,
-#           and aggregate everything into /tmp/clamav_audit.txt
-#           on the Ansible control node.
+# Playbook: ClamAV_Check_Linux.yml
+# Purpose : Audit ClamAV scanner/updater status on Linux hosts,
+#           avoid false positives from freshclam-only installs,
+#           and aggregate results into /tmp on the control node.
 # --------------------------------------------------------------
 
 - name: ClamAV Installation and Signature Audit
   hosts: all
-  become: true
-  gather_facts: false                         # we collect only what we need
-
-  vars:
-    # Destination file on the control node
-    aggregated_file: /tmp/clamav_audit_{{ now('%Y-%m-%d') }}.txt
+  gather_facts: false
+  become: false
 
   tasks:
 
-    # -----------------------------------------------------------------
-    # 1️⃣  Run freshclam to get version / signature info (do not fail)
-    # -----------------------------------------------------------------
-    - name: Check ClamAV version and signatures
-      ansible.builtin.command: freshclam --version
-      register: freshclam_out
+    - name: Check ClamAV scanner version
+      ansible.builtin.command: clamscan --version
+      register: clamscan_version
       changed_when: false
-      failed_when: false   # continue even if ClamAV is missing
+      failed_when: false
 
-    # -----------------------------------------------------------------
-    # 2️⃣  Build a dict with the audit information for this host
-    # -----------------------------------------------------------------
-    - name: Build ClamAV audit facts
-      ansible.builtin.set_fact:
-        clamav_audit:
-          installed: "{{ freshclam_out.rc == 0 }}"
-          engine_version: >-
-            {{
-              freshclam_out.stdout.split('/')[0]
-              if freshclam_out.rc == 0 else 'not installed'
-            }}
-          signature_version: >-
-            {{
-              (freshclam_out.stdout.split('/')[-2] | regex_replace('\\[.*$', ''))
-              if freshclam_out.rc == 0 and '/' in freshclam_out.stdout
-              else 'unknown'
-            }}
-          signature_date: >-
-            {{
-              freshclam_out.stdout.split('/')[-1]
-              if freshclam_out.rc == 0 and '/' in freshclam_out.stdout
-              else 'unknown'
-            }}
+    - name: Check Freshclam updater version
+      ansible.builtin.command: freshclam --version
+      register: freshclam_version
+      changed_when: false
+      failed_when: false
 
-    # -----------------------------------------------------------------
-    # 3️⃣  Capture a UTC timestamp for this host (used in the final report)
-    # -----------------------------------------------------------------
+    - name: Check ClamAV RPM packages
+      ansible.builtin.command: rpm -q clamav clamav-update clamd
+      register: clamav_rpm_check
+      changed_when: false
+      failed_when: false
+
     - name: Capture UTC timestamp for this host
       ansible.builtin.command: date -u +"%Y-%m-%d %H:%M:%S UTC"
       register: host_timestamp
       changed_when: false
+      failed_when: false
 
-    # -----------------------------------------------------------------
-    # 4️⃣  (Optional) Show the audit summary for this host on the console
-    # -----------------------------------------------------------------
-    - name: Show ClamAV audit summary (debug)
-      ansible.builtin.debug:
-        var: clamav_audit
-      when: false   # set to true if you want per‑host console output
+    - name: Build ClamAV audit facts
+      ansible.builtin.set_fact:
+        clamav_audit:
+          scanner_installed: "{{ clamscan_version.rc == 0 }}"
+          updater_installed: "{{ freshclam_version.rc == 0 }}"
+          clamav_installed: "{{ clamscan_version.rc == 0 }}"
+          fully_installed: "{{ clamscan_version.rc == 0 and freshclam_version.rc == 0 }}"
 
-  # -----------------------------------------------------------------
-  # 5️⃣  After every host is processed, write a single aggregated file
-  # -----------------------------------------------------------------
-  post_tasks:
-    - name: Write aggregated ClamAV audit report to {{ aggregated_file }} on the control node
+          scanner_version_raw: >-
+            {{
+              clamscan_version.stdout
+              if clamscan_version.rc == 0
+              else 'clamscan not installed or not in PATH'
+            }}
+
+          freshclam_version_raw: >-
+            {{
+              freshclam_version.stdout
+              if freshclam_version.rc == 0
+              else 'freshclam not installed or not in PATH'
+            }}
+
+          engine_version: >-
+            {{
+              clamscan_version.stdout.split('/')[0]
+              if clamscan_version.rc == 0 and '/' in clamscan_version.stdout
+              else 'unknown'
+            }}
+
+          signature_version: >-
+            {{
+              clamscan_version.stdout.split('/')[1]
+              if clamscan_version.rc == 0 and clamscan_version.stdout.split('/') | length > 1
+              else 'unknown'
+            }}
+
+          signature_date: >-
+            {{
+              clamscan_version.stdout.split('/')[2]
+              if clamscan_version.rc == 0 and clamscan_version.stdout.split('/') | length > 2
+              else 'unknown'
+            }}
+
+          rpm_packages: "{{ clamav_rpm_check.stdout_lines | default([]) }}"
+          rpm_package_errors: "{{ clamav_rpm_check.stderr_lines | default([]) }}"
+
+
+- name: Write aggregated ClamAV audit report on control node
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    aggregated_file: "/tmp/clamav_audit_{{ lookup('pipe', 'date -u +%Y-%m-%d_%H-%M-%S') }}.txt"
+    audit_hosts: "{{ groups['all'] | difference(['localhost']) }}"
+
+  tasks:
+
+    - name: Write aggregated ClamAV audit report
       ansible.builtin.copy:
         dest: "{{ aggregated_file }}"
-        mode: '0644'
+        mode: "0644"
         content: |
-          {% for host in groups['all'] %}
-          ### {{ host }} ###
-          Timestamp: {{ hostvars[host]['host_timestamp']['stdout'] | default('N/A') }}
+          ClamAV Audit Report
+          Generated: {{ lookup('pipe', 'date -u +"%Y-%m-%d %H:%M:%S UTC"') }}
 
-          Installed          : {{ hostvars[host]['clamav_audit']['installed'] }}
-          Engine version     : {{ hostvars[host]['clamav_audit']['engine_version'] }}
-          Signature version  : {{ hostvars[host]['clamav_audit']['signature_version'] }}
-          Signature date     : {{ hostvars[host]['clamav_audit']['signature_date'] }}
+          {% for host in audit_hosts %}
+          ============================================================
+          Host: {{ host }}
+          ============================================================
+
+          Timestamp          : {{ hostvars[host].host_timestamp.stdout | default('N/A') }}
+
+          Scanner installed  : {{ hostvars[host].clamav_audit.scanner_installed | default('N/A') }}
+          Updater installed  : {{ hostvars[host].clamav_audit.updater_installed | default('N/A') }}
+          ClamAV installed   : {{ hostvars[host].clamav_audit.clamav_installed | default('N/A') }}
+          Fully installed    : {{ hostvars[host].clamav_audit.fully_installed | default('N/A') }}
+
+          Engine version     : {{ hostvars[host].clamav_audit.engine_version | default('N/A') }}
+          Signature version  : {{ hostvars[host].clamav_audit.signature_version | default('N/A') }}
+          Signature date     : {{ hostvars[host].clamav_audit.signature_date | default('N/A') }}
+
+          Raw clamscan output:
+          {{ hostvars[host].clamav_audit.scanner_version_raw | default('N/A') }}
+
+          Raw freshclam output:
+          {{ hostvars[host].clamav_audit.freshclam_version_raw | default('N/A') }}
+
+          RPM package results:
+          {% for pkg in hostvars[host].clamav_audit.rpm_packages | default([]) %}
+          - {{ pkg }}
+          {% endfor %}
+
+          RPM package errors:
+          {% for err in hostvars[host].clamav_audit.rpm_package_errors | default([]) %}
+          - {{ err }}
+          {% endfor %}
 
           {% endfor %}
-      delegate_to: localhost
-      run_once: true               # only one host creates the file
-      changed_when: true
 
     - name: Inform where the aggregated report is stored
       ansible.builtin.debug:
         msg: "Aggregated ClamAV audit saved as {{ aggregated_file }} on the control node."
-      delegate_to: localhost
-      run_once: true

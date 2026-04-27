@@ -1,8 +1,8 @@
 ---
 - name: Gather successful and failed logon events from last 7 days
   hosts: all
-  gather_facts: no
-  become: yes
+  gather_facts: true
+  become: true
 
   vars:
     days: 7
@@ -10,24 +10,27 @@
   tasks:
 
     - name: Get current date (epoch)
-      command: date +%s
+      ansible.builtin.command: date +%s
       register: now_epoch
+      changed_when: false
 
     - name: Calculate cutoff date (7 days ago)
-      set_fact:
+      ansible.builtin.set_fact:
         cutoff_epoch: "{{ now_epoch.stdout | int - (days * 86400) }}"
 
     - name: Get successful logins (last)
-      command: last -F
+      ansible.builtin.command: last -F
       register: last_success
+      changed_when: false
 
     - name: Get failed logins (lastb)
-      command: lastb -F
+      ansible.builtin.command: lastb -F
       register: last_failed
-      ignore_errors: yes
+      ignore_errors: true
+      changed_when: false
 
     - name: Parse successful logins from last 7 days
-      set_fact:
+      ansible.builtin.set_fact:
         success_events: >-
           {{
             last_success.stdout_lines
@@ -45,7 +48,7 @@
           }}
 
     - name: Parse failed logins from last 7 days
-      set_fact:
+      ansible.builtin.set_fact:
         failed_events: >-
           {{
             last_failed.stdout_lines
@@ -54,15 +57,15 @@
           }}
 
     - name: Count successful logins
-      set_fact:
+      ansible.builtin.set_fact:
         success_count: "{{ success_events | length }}"
 
     - name: Count failed logins
-      set_fact:
+      ansible.builtin.set_fact:
         failed_count: "{{ failed_events | length }}"
 
     - name: Display results
-      debug:
+      ansible.builtin.debug:
         msg:
           successful_logins_last_7_days: "{{ success_count }}"
           failed_logins_last_7_days: "{{ failed_count }}"

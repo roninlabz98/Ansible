@@ -8,7 +8,7 @@
 
 - name: Extract sudoers users, groups, and permissions
   hosts: all                # adjust to your inventory group / host list
-  become: yes
+  become: true
   gather_facts: false
 
   vars:
@@ -34,7 +34,7 @@
         file_type: file
         patterns: '*'
       register: sudoers_d_find
-      ignore_errors: yes         # the directory may not exist – that is fine
+      ignore_errors: true         # the directory may not exist – that is fine
 
     # -----------------------------------------------------------------
     # Slurp (read) each file that was found
