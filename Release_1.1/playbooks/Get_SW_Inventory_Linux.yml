@@ -1,0 +1,93 @@
+---
+- name: Capture RHEL software baseline and aggregate on controller
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # Folder and file on control node
+    local_baseline_dir: /tmp
+    aggregated_baseline_file: "{{ local_baseline_dir }}/all_hosts_sw_baseline_{{ now('%Y-%m-%d') }}.txt"
+    remote_baseline_file: /tmp/remote_baseline.txt
+  tasks:
+    - name: Ensure local baseline folder exists on control node
+      local_action:
+        module: file
+        path: "{{ local_baseline_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Capture OS release
+      command: cat /etc/redhat-release
+      register: os_release
+      changed_when: false
+
+    - name: Capture kernel version
+      command: uname -r
+      register: kernel_version
+      changed_when: false
+
+    - name: Capture installed RPM packages (alphabetical)
+      command: rpm -qa | sort
+      register: rpm_packages
+      changed_when: false
+
+    - name: Capture enabled services
+      command: systemctl list-unit-files --type=service --state=enabled --no-pager
+      register: enabled_services
+      changed_when: false
+
+    - name: Capture running services
+      command: systemctl list-units --type=service --state=running --no-pager
+      register: running_services
+      changed_when: false
+
+    - name: Write temporary baseline file on host
+      copy:
+        dest: "{{ remote_baseline_file }}"
+        mode: "0644"
+        content: |
+          ==========================
+          HOST: {{ ansible_facts['hostname'] }}
+          Collected: {{ ansible_facts['date_time']['iso8601'] }}
+          ==========================
+
+          OS Release:
+          {{ os_release.stdout }}
+
+          Kernel Version:
+          {{ kernel_version.stdout }}
+
+          Installed RPM Packages (Alphabetical):
+          --------------------------------------
+          {% for pkg in rpm_packages.stdout_lines %}
+          {{ pkg }}
+          {% endfor %}
+
+          Enabled Services:
+          -----------------
+          {% for svc in enabled_services.stdout_lines %}
+          {{ svc }}
+          {% endfor %}
+
+          Running Services:
+          -----------------
+          {% for svc in running_services.stdout_lines %}
+          {{ svc }}
+          {% endfor %}
+
+    - name: Read temporary baseline file into variable
+      slurp:
+        src: "{{ remote_baseline_file }}"
+      register: slurped_baseline
+
+    - name: Append host baseline to aggregated file on controller
+      local_action:
+        module: shell
+        cmd: "echo '{{ slurped_baseline.content | b64decode }}' >> {{ aggregated_baseline_file }}"
+
+
+    - name: Remove temporary baseline file from host
+      file:
+        path: "{{ remote_baseline_file }}"
+        state: absent

@@ -1,0 +1,84 @@
+---
+# --------------------------------------------------------------
+# Playbook : windows_disk_usage_aggregate.yml
+# Purpose  : Collect disk‑usage on every Windows host and write a
+#            single aggregated report on the Ansible control node.
+# --------------------------------------------------------------
+
+- name: Collect disk usage from Windows hosts
+  hosts: windows                     # <-- change to the group that holds your Windows machines
+  gather_facts: false
+  become: true                       # needed for registry / WMI queries
+  become_method: runas
+
+  vars:
+    # Path **on the control node** where the final report will be stored
+    aggregate_file: "/tmp/ansible_disk_usage_all_host_{{ now('%Y-%m-%d') }}.txt"
+
+  tasks:
+
+    # -----------------------------------------------------------------
+    # Gather a nicely‑formatted list of local drives
+    # -----------------------------------------------------------------
+    - name: Collect disk usage on the remote Windows host
+      win_shell: |
+        # PowerShell script – you can edit the format string if you like
+        $date = Get-Date -Format "yyyy-MM-ddTHH:mm:sszzz"
+        Write-Output "=================================="
+        Write-Output "Host: $env:COMPUTERNAME"
+        Write-Output "Date: $date"
+        Write-Output "=================================="
+
+        # Only physical drives (DriveType = 3)
+        Get-WmiObject Win32_LogicalDisk |
+          Where-Object {$_.DriveType -eq 3} |
+          ForEach-Object {
+            $sizeGB = [math]::Round($_.Size/1GB,2)
+            $freeGB = [math]::Round($_.FreeSpace/1GB,2)
+            $usedGB = $sizeGB - $freeGB
+            $pctUsed = if ($sizeGB -ne 0) { [math]::Round(($usedGB/$sizeGB)*100,1) } else { 0 }
+            "{0,-10} {1,8}GB {2,8}GB {3,8}GB {4,5}% {5}" -f `
+              $_.DeviceID, $sizeGB, $usedGB, $freeGB, $pctUsed, $_.FileSystem
+          }
+      register: disk_output
+      changed_when: false
+
+    # -----------------------------------------------------------------
+    # Ensure the directory for the aggregated file exists on the
+    #     **control node** (runs locally)
+    # -----------------------------------------------------------------
+    - name: Ensure local directory for the aggregated report exists
+      local_action:
+        module: file
+        path: "{{ aggregate_file | dirname }}"
+        state: directory
+        mode: '0755'
+
+    # -----------------------------------------------------------------
+    # Write (or overwrite) the file when we are processing the
+    #     *first* host in the inventory
+    # -----------------------------------------------------------------
+    - name: Write fresh aggregate file (first host only)
+      local_action:
+        module: copy
+        dest: "{{ aggregate_file }}"
+        mode: '0644'
+        content: "{{ disk_output.stdout }}\n"
+      when: inventory_hostname == groups['all'][0]
+
+    # -----------------------------------------------------------------
+    # Append the output of every *other* host to the same file
+    # -----------------------------------------------------------------
+    - name: Append disk usage of subsequent hosts
+      local_action:
+        module: shell
+        cmd: "echo '{{ disk_output.stdout }}' >> {{ aggregate_file }}"
+      when: inventory_hostname != groups['all'][0]
+
+    # -----------------------------------------------------------------
+    # (Optional) Show the host‑specific output on the console –
+    #     handy while testing/debugging
+    # -----------------------------------------------------------------
+    - name: Debug host disk usage (optional)
+      debug:
+        var: disk_output.stdout_lines

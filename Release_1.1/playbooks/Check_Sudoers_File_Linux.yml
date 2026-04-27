@@ -1,0 +1,108 @@
+---
+# --------------------------------------------------------------
+# Playbook: extract_sudoers.yml
+# Purpose : Read /etc/sudoers and any files in /etc/sudoers.d,
+#           then return a structured list:
+#               [ "who", "run‑as‑users", "permissions" ]
+# --------------------------------------------------------------
+
+- name: Extract sudoers users, groups, and permissions
+  hosts: all                # adjust to your inventory group / host list
+  become: yes
+  gather_facts: false
+
+  vars:
+    # Regular expression that matches real privilege lines (user or %group)
+    sudoers_line_regex: '^(%?)[A-Za-z0-9._-]+\s+ALL=.*'
+
+  tasks:
+
+    # -----------------------------------------------------------------
+    # Read the main sudoers file (always present)
+    # -----------------------------------------------------------------
+    - name: Read main sudoers file
+      ansible.builtin.command: cat /etc/sudoers
+      register: sudoers_main
+      changed_when: false
+
+    # -----------------------------------------------------------------
+    # Discover files under /etc/sudoers.d (if the directory exists)
+    # -----------------------------------------------------------------
+    - name: Find files in /etc/sudoers.d
+      ansible.builtin.find:
+        paths: /etc/sudoers.d
+        file_type: file
+        patterns: '*'
+      register: sudoers_d_find
+      ignore_errors: yes         # the directory may not exist – that is fine
+
+    # -----------------------------------------------------------------
+    # Slurp (read) each file that was found
+    # -----------------------------------------------------------------
+    - name: Slurp content of each sudoers.d file
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      register: sudoers_d_slurp
+      loop: "{{ sudoers_d_find.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: sudoers_d_find.matched | default(0) > 0
+
+    # -----------------------------------------------------------------
+    # Turn the slurped base64 data into a flat list of lines
+    # -----------------------------------------------------------------
+    - name: Build a list of lines from the slurped files
+      ansible.builtin.set_fact:
+        sudoers_d_lines: >-
+          {{
+            sudoers_d_lines | default([]) +
+            (item.content | b64decode).split('\n')
+          }}
+      loop: "{{ sudoers_d_slurp.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+
+    # -----------------------------------------------------------------
+    # Combine the main sudoers lines with any lines from sudoers.d
+    # -----------------------------------------------------------------
+    - name: Combine all sudoers content into a single list of lines
+      ansible.builtin.set_fact:
+        sudoers_all_lines: >-
+          {{
+            sudoers_main.stdout_lines
+            + (sudoers_d_lines | default([]))
+          }}
+
+    # -----------------------------------------------------------------
+    # Keep only the lines that actually define privileges
+    # -----------------------------------------------------------------
+    - name: Filter only user and group privilege lines
+      ansible.builtin.set_fact:
+        sudo_entries: >-
+          {{
+            sudoers_all_lines
+            | select('match', sudoers_line_regex)
+            | list
+          }}
+
+    # -----------------------------------------------------------------
+    # Parse each entry into “who | run‑as | permissions”
+    # -----------------------------------------------------------------
+    - name: Parse sudoers entries into a structured list
+      ansible.builtin.set_fact:
+        sudo_parsed: >-
+          {{
+            sudo_entries
+            | map('regex_replace',
+                '^%?([A-Za-z0-9._-]+)\\s+ALL=\\(([^)]*)\\)(.*)$',
+                '\\1|\\2|\\3')
+            | list
+          }}
+
+    # -----------------------------------------------------------------
+    # Display the parsed data (replace with export if needed)
+    # -----------------------------------------------------------------
+    - name: Display parsed sudoers (who | run‑as | permissions)
+      ansible.builtin.debug:
+        msg: "{{ item.split('|') }}"
+      loop: "{{ sudo_parsed }}"

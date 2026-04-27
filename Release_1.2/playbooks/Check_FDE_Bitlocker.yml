@@ -1,0 +1,97 @@
+---
+- name: Gather BitLocker status from Windows hosts
+  hosts: windows               # <-- adjust to your inventory group/name
+  gather_facts: false
+  become: yes                  # run as Administrator
+  become_method: runas
+
+  vars:
+    # -----------------------------------------------------------------
+    # PowerShell snippet that returns a clean object for each volume
+    # -----------------------------------------------------------------
+    ps_bitlocker_query: |
+      # Import the BitLocker module (quietly) – it exists on Windows 10/Server 2016+
+      Import-Module BitLocker -ErrorAction SilentlyContinue
+
+      # Get‑BitLockerVolume returns a PSObject for each fixed drive
+      Get‑BitLockerVolume |
+        Select-Object `
+          DriveLetter,
+          VolumeStatus,
+          ProtectionStatus,
+          EncryptionPercentage,
+          KeyProtector |
+        ConvertTo‑Json -Depth 5
+    # -----------------------------------------------------------------
+    # CSV header – used when we write the report locally
+    # -----------------------------------------------------------------
+    csv_header: "Host,DriveLetter,VolumeStatus,ProtectionStatus,EncryptionPercentage,KeyProtectorType"
+
+  tasks:
+
+    # -------------------------------------------------------------
+    # Run PowerShell, capture the JSON output
+    # -------------------------------------------------------------
+    - name: Query BitLocker status via PowerShell
+      win_shell: "{{ ps_bitlocker_query }}"
+      register: bitlocker_ps
+      changed_when: false               # this is a read‑only operation
+
+    # -------------------------------------------------------------
+    # Convert the JSON string into a list of dictionaries
+    # -------------------------------------------------------------
+    - name: Parse PowerShell JSON into a fact
+      set_fact:
+        bitlocker_facts: "{{ bitlocker_ps.stdout | from_json }}"
+      when: bitlocker_ps.stdout != ''
+
+    # -------------------------------------------------------------
+    # Normalise the data (flatten the nested KeyProtector objects)
+    # -------------------------------------------------------------
+    - name: Normalise BitLocker facts
+      set_fact:
+        bitlocker_report: >-
+          {{
+            bitlocker_facts |
+            map('combine', {
+              'KeyProtectorType':
+                (item.KeyProtector |
+                 map(attribute='KeyProtectorType') |
+                 join('; '))
+            }) |
+            list
+          }}
+      when: bitlocker_facts is defined
+
+    # -------------------------------------------------------------
+    # (Optional) Write a CSV file on the **control node**
+    # -------------------------------------------------------------
+    - name: Write CSV report locally
+      delegate_to: localhost
+      run_once: true
+      copy:
+        dest: "./bitlocker-report-{{ ansible_date_time.iso8601_basic }}.csv"
+        content: |
+          {{ csv_header }}
+          {% for host in groups['windows'] %}
+          {%   set b = hostvars[host].bitlocker_report | default([]) %}
+          {%   for vol in b %}
+          {{ host }},{{ vol.DriveLetter }},{{ vol.VolumeStatus }},{{ vol.ProtectionStatus }},{{ vol.EncryptionPercentage }},{{ vol.KeyProtectorType }}
+          {%   endfor %}
+          {% endfor %}
+      when: bitlocker_report is defined
+
+    # -------------------------------------------------------------
+    # Print a concise, colour‑coded summary for the operator
+    # -------------------------------------------------------------
+    - name: Show BitLocker summary per host
+      debug:
+        msg: |
+          {% for vol in bitlocker_report %}
+          {{ inventory_hostname }} – {{ vol.DriveLetter }}:
+            • VolumeStatus      : {{ vol.VolumeStatus }}
+            • ProtectionStatus  : {{ vol.ProtectionStatus }}
+            • Encryption %      : {{ vol.EncryptionPercentage }}%
+            • KeyProtector(s)   : {{ vol.KeyProtectorType }}
+          {% endfor %}
+      when: bitlocker_report is defined

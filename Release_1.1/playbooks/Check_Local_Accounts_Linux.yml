@@ -1,0 +1,139 @@
+---
+# --------------------------------------------------------------
+# Playbook: gather-local-accounts.yml
+# Purpose : Read /etc/passwd and /etc/shadow, report each
+#           account together with its enabled/disabled status,
+#           and write an aggregated file on the control node.
+# --------------------------------------------------------------
+
+- name: Gather local Linux accounts and enabled/disabled status
+  hosts: all                     # adjust to your inventory group / host list
+  become: true                    # reading /etc/shadow needs root
+  gather_facts: false
+
+  vars:
+    # shells that are considered “disabled” for a login account
+    disabled_shells:
+      - /sbin/nologin
+      - /usr/sbin/nologin
+      - /bin/false
+
+    # Path on the **control** node where the final aggregated report will be stored
+    aggregated_file: /tmp/local-accounts_{{ now('%Y-%m-%d') }}.txt
+
+  tasks:
+
+    # -----------------------------------------------------------------
+    # Read the two files
+    # -----------------------------------------------------------------
+    - name: Read /etc/passwd
+      ansible.builtin.command: cat /etc/passwd
+      register: passwd_file
+      changed_when: false
+
+    - name: Read /etc/shadow
+      ansible.builtin.command: cat /etc/shadow
+      register: shadow_file
+      changed_when: false
+
+    # -----------------------------------------------------------------
+    # Split each line on ':' to obtain a list of fields
+    # -----------------------------------------------------------------
+    - name: Parse passwd and shadow into lists of fields
+      ansible.builtin.set_fact:
+        passwd_entries: "{{ passwd_file.stdout_lines | map('split', ':') | list }}"
+        shadow_entries: "{{ shadow_file.stdout_lines | map('split', ':') | list }}"
+
+    # -----------------------------------------------------------------
+    # Build a **lookup dictionary**: username → password field
+    # -----------------------------------------------------------------
+    - name: Initialise empty lookup dictionary
+      ansible.builtin.set_fact:
+        shadow_lookup: {}
+
+    - name: Populate shadow_lookup with username => password
+      ansible.builtin.set_fact:
+        shadow_lookup: "{{ shadow_lookup | combine({ item[0]: item[1] }) }}"
+      loop: "{{ shadow_entries }}"
+      loop_control:
+        label: "{{ item[0] }}"
+
+    # -----------------------------------------------------------------
+    # Iterate over passwd entries and construct the final report list
+    # -----------------------------------------------------------------
+    - name: Build account status list
+      ansible.builtin.set_fact:
+        account_status: >-
+          {{
+            account_status | default([]) + [
+              {
+                'username'      : item[0],
+                'uid'           : item[2],
+                'gid'           : item[3],
+                'comment'       : item[4],
+                'home'          : item[5],
+                'shell'         : item[6],
+                'password_field': shadow_lookup.get(item[0], ''),
+                'status'        : (
+                  (shadow_lookup.get(item[0], '') is not defined) or
+                  (shadow_lookup.get(item[0], '') | regex_search('^[!*]')) or
+                  (item[6] in disabled_shells)
+                ) | ternary('disabled', 'enabled')
+              }
+            ]
+          }}
+      loop: "{{ passwd_entries }}"
+      loop_control:
+        label: "{{ item[0] }}"
+      changed_when: false
+
+    # -----------------------------------------------------------------
+    # Show the collected information per host (optional, handy while testing)
+    # -----------------------------------------------------------------
+    - name: Display account status for this host
+      ansible.builtin.debug:
+        var: account_status
+
+    # -----------------------------------------------------------------
+    # Capture a UTC timestamp for the host – will be used in the final file
+    # -----------------------------------------------------------------
+    - name: Capture UTC timestamp for this host
+      ansible.builtin.command: date -u +"%Y-%m-%d %H:%M:%S UTC"
+      register: host_timestamp
+      changed_when: false
+
+  # --------------------------------------------------------------
+  # After every host is processed, aggregate everything on the control node
+  # --------------------------------------------------------------
+  post_tasks:
+    - name: Write aggregated report to {{ aggregated_file }} on the control node
+      ansible.builtin.copy:
+        # Jinja2 loop walks the entire inventory and pulls the two pieces we saved
+        content: |
+          {% for h in groups['all'] %}
+          ### {{ h }} ###
+          Timestamp: {{ hostvars[h]['host_timestamp']['stdout'] | default('N/A') }}
+
+          {% for acct in hostvars[h]['account_status'] | default([]) %}
+          - username      : {{ acct.username }}
+            uid           : {{ acct.uid }}
+            gid           : {{ acct.gid }}
+            comment       : {{ acct.comment }}
+            home          : {{ acct.home }}
+            shell         : {{ acct.shell }}
+            password_hash : {{ acct.password_field }}
+            status        : {{ acct.status }}
+          {% endfor %}
+
+          {% endfor %}
+        dest: "{{ aggregated_file }}"
+        mode: '0644'
+      delegate_to: localhost
+      run_once: true               # only one host performs the write
+      changed_when: true
+
+    - name: Show path of the aggregated file (optional)
+      ansible.builtin.debug:
+        msg: "Aggregated account report written to {{ aggregated_file }} on the control node."
+      delegate_to: localhost
+      run_once: true

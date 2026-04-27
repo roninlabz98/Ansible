@@ -1,0 +1,70 @@
+---
+- name: Gather successful and failed logon events from last 7 days
+  hosts: all
+  gather_facts: no
+  become: yes
+
+  vars:
+    days: 7
+
+  tasks:
+
+    - name: Get current date (epoch)
+      command: date +%s
+      register: now_epoch
+
+    - name: Calculate cutoff date (7 days ago)
+      set_fact:
+        cutoff_epoch: "{{ now_epoch.stdout | int - (days * 86400) }}"
+
+    - name: Get successful logins (last)
+      command: last -F
+      register: last_success
+
+    - name: Get failed logins (lastb)
+      command: lastb -F
+      register: last_failed
+      ignore_errors: yes
+
+    - name: Parse successful logins from last 7 days
+      set_fact:
+        success_events: >-
+          {{
+            last_success.stdout_lines
+            | select('match', '.*(Mon|Tue|Wed|Thu|Fri|Sat|Sun).*')
+            | select('search', '(.*)')
+            | selectattr(
+                '0',
+                'defined'
+              )
+            | select(
+                'match',
+                '.*'
+              )
+            | list
+          }}
+
+    - name: Parse failed logins from last 7 days
+      set_fact:
+        failed_events: >-
+          {{
+            last_failed.stdout_lines
+            | select('match', '.*(Mon|Tue|Wed|Thu|Fri|Sat|Sun).*')
+            | list
+          }}
+
+    - name: Count successful logins
+      set_fact:
+        success_count: "{{ success_events | length }}"
+
+    - name: Count failed logins
+      set_fact:
+        failed_count: "{{ failed_events | length }}"
+
+    - name: Display results
+      debug:
+        msg:
+          successful_logins_last_7_days: "{{ success_count }}"
+          failed_logins_last_7_days: "{{ failed_count }}"
+          successful_logins_details: "{{ success_events }}"
+          failed_logins_details: "{{ failed_events }}"

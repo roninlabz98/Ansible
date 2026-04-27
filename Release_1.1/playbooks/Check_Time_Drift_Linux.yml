@@ -1,0 +1,47 @@
+---
+- name: Time Drift Audit Report
+  hosts: all
+  gather_facts: false
+  vars:
+    time_format: "%Y-%m-%dT%H:%M:%S%z"
+    reference_host: "{{ groups['all'][0] }}"   # Pick your reference host
+    report_file: "/tmp/ansible_time_audit_report_{{ now('%Y-%m-%d') }}.txt"  # Destination on control node
+
+  tasks:
+    - name: Get current time on host
+      ansible.builtin.command: date +"{{ time_format }}"
+      register: host_time
+      changed_when: false
+
+    - name: Save current time fact
+      ansible.builtin.set_fact:
+        current_time: "{{ host_time.stdout }}"
+
+- name: Generate final time audit report on control node
+  hosts: localhost
+  gather_facts: false
+  vars:
+    time_format: "%Y-%m-%dT%H:%M:%S%z"
+    reference_host: "{{ groups['all'][0] }}"
+    report_file: "/tmp/ansible_time_audit_report_{{ now('%Y-%m-%d') }}.txt"
+  tasks:
+
+    - name: Build report content
+      ansible.builtin.set_fact:
+        report_content: |
+          ==============================================
+          TIME AUDIT REPORT - Generated: {{ lookup('pipe','date +%Y-%m-%dT%H:%M:%S%z') }}
+          Reference Host: {{ reference_host }} ({{ hostvars[reference_host]['current_time'] }})
+          ==============================================
+          {% for host in groups['all'] %}
+          Host: {{ host }}
+          Current Time: {{ hostvars[host]['current_time'] }}
+          Time Delta (seconds): {{ (hostvars[host]['current_time'] | to_datetime(time_format) - hostvars[reference_host]['current_time'] | to_datetime(time_format)).total_seconds() | round(0) }}
+          ----------------------------------------------
+          {% endfor %}
+
+    - name: Write report to file on control node
+      ansible.builtin.copy:
+        content: "{{ report_content }}"
+        dest: "{{ report_file }}"
+        mode: '0644'

@@ -1,0 +1,55 @@
+---
+- name: Verify Luks encryption via viewing block devices
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    # Destination file on the control node that will contain all hosts' output
+    aggregated_file: /tmp/block_devices_aggregated_{{ now('%Y-%m-%d') }}.txt
+
+  tasks:
+    # --------------------------------------------------------------
+    # Capture a UTC timestamp on the remote host
+    # --------------------------------------------------------------
+    - name: Capture current UTC timestamp
+      ansible.builtin.command: date -u +"%Y-%m-%d %H:%M:%S UTC"
+      register: timestamp_output
+      changed_when: false
+
+    # --------------------------------------------------------------
+    # Run lsblk **with normal padded columns** and **exclude loop devices**
+    # --------------------------------------------------------------
+    - name: Run lsblk (padded, exclude loop devices)
+      ansible.builtin.command: >
+        lsblk
+        -o NAME,TYPE,FSTYPE,MOUNTPOINT
+        --exclude 7,11
+      register: lsblk_output
+      changed_when: false
+
+    - name: Debug – show this host's block devices
+      ansible.builtin.debug:
+        msg: |
+          Block Devices (padded, no loops) on {{ inventory_hostname }} at {{ timestamp_output.stdout }}:
+          {{ lsblk_output.stdout }}
+
+  # --------------------------------------------------------------
+  # After all hosts are done, build the aggregated file on the control node
+  # --------------------------------------------------------------
+  post_tasks:
+    - name: Assemble all hosts' outputs into one file on the control node
+      ansible.builtin.copy:
+        # Jinja2 loop collects the two variables from every host
+        content: |
+          {% for h in groups['all'] %}
+          ### {{ h }} ###
+          Timestamp: {{ hostvars[h]['timestamp_output']['stdout'] | default('N/A') }}
+          {{ hostvars[h]['lsblk_output']['stdout'] | default('') }}
+
+          {% endfor %}
+        dest: "{{ aggregated_file }}"
+        mode: '0644'
+      delegate_to: localhost
+      run_once: true
+      changed_when: true

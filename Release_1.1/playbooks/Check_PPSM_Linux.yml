@@ -1,0 +1,58 @@
+---
+# --------------------------------------------------------------
+# Playbook: collect_listening_sockets.yml
+# Purpose : Run `ss -tulnp` on every Linux endpoint and write a
+#           single aggregated report to /tmp/ss_report.txt on the
+#           Ansible control node.
+# --------------------------------------------------------------
+
+- name: Collect listening socket information from Linux endpoints
+  hosts: all
+  gather_facts: false
+  become: true
+
+  vars:
+    # Destination file on the control node
+    aggregated_file: /tmp/ss_report_{{ now('%Y-%m-%d') }}.txt
+
+  tasks:
+
+    - name: Run ss -tulnp
+      ansible.builtin.command: ss -tulnp
+      register: ss_output
+      changed_when: false                               # gathering data never changes the remote host
+
+    - name: Print results to console (debug)
+      ansible.builtin.debug:
+        var: ss_output.stdout_lines
+
+    - name: Capture a UTC timestamp for this host (used in the final report)
+      command: date -u +"%Y-%m-%d %H:%M:%S UTC"
+      register: host_timestamp
+      changed_when: false
+
+  # -----------------------------------------------------------------
+  # After every host is done, create a single aggregated file
+  # -----------------------------------------------------------------
+  post_tasks:
+    - name: Write aggregated ss report to {{ aggregated_file }} on the control node
+      copy:
+        dest: "{{ aggregated_file }}"
+        mode: '0644'
+        content: |
+          {% for h in groups['all'] %}
+          ### {{ h }} ###
+          Timestamp: {{ hostvars[h]['host_timestamp']['stdout'] | default('N/A') }}
+
+          {{ hostvars[h]['ss_output']['stdout'] | default('No output collected') }}
+
+          {% endfor %}
+      delegate_to: localhost
+      run_once: true               # only one host performs the write
+      changed_when: true
+
+    - name: Show where the aggregated report was written (optional)
+      ansible.builtin.debug:
+        msg: "Aggregated SS report saved to {{ aggregated_file }} on the control node."
+      delegate_to: localhost
+      run_once: true

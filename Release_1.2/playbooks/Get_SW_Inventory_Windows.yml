@@ -1,0 +1,178 @@
+---
+# --------------------------------------------------------------
+# Playbook: windows_sw_baseline.yml
+# Purpose : Capture a software / services baseline from every
+#           Windows host and aggregate the results on the
+#           Ansible control node.
+# --------------------------------------------------------------
+
+- name: Capture Windows software baseline on each host
+  hosts: windows               # ← adjust to the group that contains your Windows nodes
+  gather_facts: false
+  become: true                 # Administrator rights are needed for the registry queries
+  become_method: runas
+
+  vars:
+    # -----------------------------------------------------------------
+    # Paths used on the **control node** (where the final report lives)
+    # -----------------------------------------------------------------
+    local_baseline_dir: "/.baselines"
+    aggregated_baseline_file: "{{ local_baseline_dir }}/all_hosts_sw_baseline_{{ now('%Y-%m-%d') }}.txt"
+
+    # -----------------------------------------------------------------
+    # Temporary file on the **remote Windows host**
+    # -----------------------------------------------------------------
+    remote_baseline_file: "C:\\Windows\\Temp\\remote_baseline.txt"
+
+    # PowerShell date format that Ansible can later parse with to_datetime()
+    iso_time_format: "yyyy-MM-ddTHH:mm:sszzz"
+
+  tasks:
+
+    # --------------------------------------------------------------
+    # Make sure the local directory exists (runs on the controller)
+    # --------------------------------------------------------------
+    - name: Ensure local baseline folder exists on controller
+      local_action:
+        module: file
+        path: "{{ local_baseline_dir }}"
+        state: directory
+        mode: '0755'
+
+    # --------------------------------------------------------------
+    # OS / kernel information
+    # --------------------------------------------------------------
+    - name: Capture OS and kernel (build) information
+      win_shell: |
+        $ci = Get-ComputerInfo
+        $os = $ci.WindowsProductName
+        $ver = $ci.WindowsVersion
+        $build = $ci.WindowsBuildLabEx
+        $arch = $ci.OSArchitecture
+        "$os`nVersion   : $ver`nBuild      : $build`nArch       : $arch"
+      register: os_info
+      changed_when: false
+
+    # --------------------------------------------------------------
+    # Timestamp (ISO‑8601) – used later in the report
+    # --------------------------------------------------------------
+    - name: Capture current timestamp on the host
+      win_shell: |
+        Get-Date -Format "{{ iso_time_format }}"
+      register: host_timestamp
+      changed_when: false
+
+    # --------------------------------------------------------------
+    # Installed programs (from the Uninstall registry keys)
+    # --------------------------------------------------------------
+    - name: Get list of installed programs (64‑bit view)
+      win_shell: |
+        Get-ItemProperty -Path "HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*" |
+          Select-Object -Property DisplayName, DisplayVersion |
+          Where-Object { $_.DisplayName } |
+          Sort-Object DisplayName |
+          ForEach-Object { "$($_.DisplayName)  $($_.DisplayVersion)" }
+      register: prog_64
+      changed_when: false
+
+    - name: Get list of installed programs (32‑bit view on 64‑bit OS)
+      win_shell: |
+        Get-ItemProperty -Path "HKLM:\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*" |
+          Select-Object -Property DisplayName, DisplayVersion |
+          Where-Object { $_.DisplayName } |
+          Sort-Object DisplayName |
+          ForEach-Object { "$($_.DisplayName)  $($_.DisplayVersion)" }
+      register: prog_32
+      changed_when: false
+
+    - name: Combine 32‑bit and 64‑bit program lists and de‑duplicate
+      set_fact:
+        installed_programs: >-
+          {{
+            (prog_64.stdout_lines + prog_32.stdout_lines) |
+            unique |
+            sort
+          }}
+
+    # --------------------------------------------------------------
+    # Enabled services (StartMode != Disabled)
+    # --------------------------------------------------------------
+    - name: Capture enabled services
+      win_shell: |
+        Get-Service | Where-Object { $_.StartType -ne 'Disabled' } |
+          Sort-Object Name |
+          ForEach-Object { "$($_.Name)  $($_.DisplayName)  $($_.StartType)" }
+      register: enabled_services
+      changed_when: false
+
+    # --------------------------------------------------------------
+    # Running services (Status = Running)
+    # --------------------------------------------------------------
+    - name: Capture running services
+      win_shell: |
+        Get-Service | Where-Object { $_.Status -eq 'Running' } |
+          Sort-Object Name |
+          ForEach-Object { "$($_.Name)  $($_.DisplayName)  $($_.Status)" }
+      register: running_services
+      changed_when: false
+
+    # --------------------------------------------------------------
+    # Write a temporary baseline file on the remote host
+    # --------------------------------------------------------------
+    - name: Write remote baseline file
+      win_copy:
+        dest: "{{ remote_baseline_file }}"
+        mode: "0644"
+        content: |
+          ==========================
+          HOST: {{ inventory_hostname }}
+          Collected: {{ host_timestamp.stdout }}
+          ==========================
+
+          OS / Kernel Information:
+          -----------------------
+          {{ os_info.stdout }}
+
+          Installed Programs (Alphabetical):
+          ---------------------------------
+          {% for prog in installed_programs %}
+          {{ prog }}
+          {% endfor %}
+
+          Enabled Services (StartMode ≠ Disabled):
+          ---------------------------------------
+          {% for svc in enabled_services.stdout_lines %}
+          {{ svc }}
+          {% endfor %}
+
+          Running Services (Status = Running):
+          ------------------------------------
+          {% for svc in running_services.stdout_lines %}
+          {{ svc }}
+          {% endfor %}
+
+    # --------------------------------------------------------------
+    # Pull the temporary file back to the controller
+    # --------------------------------------------------------------
+    - name: Slurp remote baseline file
+      slurp:
+        src: "{{ remote_baseline_file }}"
+      register: slurped_baseline
+
+    # --------------------------------------------------------------
+    # Append the host’s section to the aggregated report on the
+    #     control node (runs locally)
+    # --------------------------------------------------------------
+    - name: Append host baseline to aggregated file on controller
+      local_action:
+        module: shell
+        cmd: "echo '{{ slurped_baseline.content | b64decode }}' >> {{ aggregated_baseline_file }}"
+      changed_when: true
+
+    # --------------------------------------------------------------
+    # Clean up the temporary file on the remote host
+    # --------------------------------------------------------------
+    - name: Remove temporary baseline file from remote host
+      win_file:
+        path: "{{ remote_baseline_file }}"
+        state: absent

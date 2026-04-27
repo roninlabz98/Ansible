@@ -1,0 +1,51 @@
+---
+- name: Query Active Directory for users, groups and enabled status
+  hosts: windows_ad_servers            # <-- adjust to your inventory group/host
+  gather_facts: false
+  vars:
+    # Optional: limit to a specific OU (use LDAP filter syntax)
+    ad_search_base: "DC=example,DC=com"
+    ad_filter: "*"                     # * = all users; you can refine e.g. "(&(objectClass=user)(!objectClass=computer))"
+  tasks:
+
+    - name: Retrieve AD user information
+      ansible.windows.win_shell: |
+        Import-Module ActiveDirectory -ErrorAction Stop
+
+        $users = Get-ADUser -SearchBase "{{ ad_search_base }}" `
+                           -Filter "{{ ad_filter }}" `
+                           -Properties MemberOf,Enabled |
+                 Select-Object `
+                     @{Name='UserName';Expression={$_.SamAccountName}},
+                     @{Name='DisplayName';Expression={$_.Name}},
+                     Enabled,
+                     @{Name='Groups';Expression={($_.MemberOf | ForEach-Object {
+                         ($_ -replace '^CN=([^,]+).+$','$1')
+                     }) -join ';'}}
+
+        # Output as JSON so Ansible can parse it easily
+        $users | ConvertTo-Json -Depth 5 -Compress
+      register: ad_user_json
+      changed_when: false               # This task is read‑only
+
+    - name: Parse JSON output into a fact
+      set_fact:
+        ad_users: "{{ ad_user_json.stdout | from_json }}"
+
+    - name: Display a summary table (optional)
+      ansible.builtin.debug:
+        msg: |
+          {% for u in ad_users %}
+          {{ "%-20s" | format(u.UserName) }}  {{ "%-6s" | format(u.Enabled) }}  {{ u.Groups }}
+          {% endfor %}
+
+    - name: Save results to a CSV file on the control machine (optional)
+      local_action:
+        module: copy
+        content: |
+          UserName,DisplayName,Enabled,Groups
+          {% for u in ad_users %}
+          "{{ u.UserName }}","{{ u.DisplayName }}",{{ u.Enabled }},"{{ u.Groups }}"
+          {% endfor %}
+        dest: "./ad_user_report_{{ inventory_hostname }}.csv"
+      run_once: true

@@ -1,0 +1,78 @@
+---
+# --------------------------------------------------------------
+# Playbook: windows_time_drift_audit.yml
+# Purpose : Collect the current time from every Windows endpoint,
+#           compare it to a reference host, and write a single
+#           aggregated report on the Ansible control node.
+# --------------------------------------------------------------
+
+# -----------------------------------------------------------------
+# Gather the current time on each Windows host
+# -----------------------------------------------------------------
+- name: Collect current time from Windows hosts
+  hosts: windows                     # adjust to the group that contains your Windows nodes
+  gather_facts: false
+  become: true                       # not strictly required for Get‑Date, but kept for consistency
+  become_method: runas
+
+  vars:
+    # ISO‑8601 format that Ansible can parse with to_datetime()
+    time_format: "%Y-%m-%dT%H:%M:%S%z"
+
+  tasks:
+
+    - name: Get current time (PowerShell)
+      win_shell: |
+        # PowerShell format: 2024-02-25T13:45:12+00:00
+        Get-Date -Format "yyyy-MM-ddTHH:mm:sszzz"
+      register: host_time
+      changed_when: false
+
+    - name: Save the time as a fact for later use
+      set_fact:
+        current_time: "{{ host_time.stdout }}"
+
+# -----------------------------------------------------------------
+# Build the audit report on the control node (localhost)
+# -----------------------------------------------------------------
+- name: Generate final time‑drift audit report on the control node
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # Same format used on the Windows side – required for to_datetime()
+    time_format: "%Y-%m-%dT%H:%M:%S%z"
+
+    # First host in the inventory becomes the reference point
+    reference_host: "{{ groups['all'][0] }}"
+
+    # Destination file on the control node (you can change the path)
+    report_file: "/tmp/ansible_time_audit_report_{{ now('%Y-%m-%d') }}.txt"
+
+  tasks:
+
+    - name: Build the multi‑line report content
+      set_fact:
+        report_content: |
+          ==============================================
+          TIME DRIFT AUDIT REPORT – Generated: {{ lookup('pipe','date +%Y-%m-%dT%H:%M:%S%z') }}
+          Reference Host: {{ reference_host }} ({{ hostvars[reference_host]['current_time'] }})
+          ==============================================
+          {% for h in groups['all'] %}
+          Host: {{ h }}
+          Current Time: {{ hostvars[h]['current_time'] }}
+          Time Delta (seconds): {{ ((hostvars[h]['current_time'] | to_datetime(time_format)) -
+                                   (hostvars[reference_host]['current_time'] | to_datetime(time_format))
+                                  ).total_seconds() | round(0) }}
+          ----------------------------------------------
+          {% endfor %}
+
+    - name: Write the aggregated report to the control node
+      copy:
+        dest: "{{ report_file }}"
+        mode: '0644'
+        content: "{{ report_content }}"
+
+    - name: Show where the report was written (optional)
+      debug:
+        msg: "Time‑drift audit report saved to {{ report_file }} on the control node."

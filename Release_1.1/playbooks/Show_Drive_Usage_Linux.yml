@@ -1,0 +1,29 @@
+---
+- name: Aggregate disk usage to control node
+  hosts: all
+  gather_facts: false
+  vars:
+    aggregate_file: /tmp/ansible_disk_usage_all_host_{{ now('%Y-%m-%d') }}.txt
+
+  tasks:
+    - name: Collect disk usage on remote host
+      ansible.builtin.shell: |
+        echo "=================================="
+        echo "Host: {{ inventory_hostname }}"
+        echo "Date: {{ ansible_date_time.iso8601 | default(lookup('pipe','date -Iseconds')) }}"
+        echo "=================================="
+        df -h -x tmpfs -x devtmpfs --output=source,fstype,size,used,avail,pcent,target | column -t
+      register: df_output
+      changed_when: false
+
+    - name: Write (or overwrite) aggregate file on first host
+      ansible.builtin.shell: |
+        echo "{{ df_output.stdout }}" > {{ aggregate_file }}
+      delegate_to: localhost
+      when: inventory_hostname == groups['all'][0]
+
+    - name: Append subsequent hosts to aggregate file
+      ansible.builtin.shell: |
+        echo "{{ df_output.stdout }}" >> {{ aggregate_file }}
+      delegate_to: localhost
+      when: inventory_hostname != groups['all'][0]

@@ -1,0 +1,102 @@
+---
+# --------------------------------------------------------------
+# Playbook: collect_ppsm_info.yml
+# Purpose : Run a Windows‑specific command that extracts PPSM
+#           information from every Windows endpoint and write a
+#           single aggregated report to /tmp/ppsm_report.txt on the
+#           Ansible control node.
+# --------------------------------------------------------------
+
+- name: Collect PPSM information from Windows endpoints
+  hosts: windows                # <-- adjust to the proper inventory group
+  gather_facts: false
+  become: true                  # required for most service / registry queries
+  become_method: runas
+
+  vars:
+    # Destination file on the control node
+    aggregated_file: "/tmp/ppsm_report_{{ now('%Y-%m-%d') }}.txt"
+
+  tasks:
+
+    # ------------------------------------------------------------
+    # Gather PPSM data (as a service – adapt if you need a
+    #    different command, e.g. a registry query or a PowerShell
+    #    module inspection)
+    # ------------------------------------------------------------
+    - name: Gather PPSM information (service view)
+      win_shell: |
+        # ----------------------------------------------------------------
+        # If “PPSM” is a service (or part of a service name), the following
+        # one‑liner returns a nicely formatted table:
+        #   - Service name
+        #   - Display name
+        #   - Current state (Running/Stopped)
+        #   - Start mode (Automatic, Manual, Disabled)
+        #   - Path to the executable (if available)
+        # ----------------------------------------------------------------
+        Get-Service -Name "*PPSM*" -ErrorAction SilentlyContinue |
+          Select-Object `
+            Name,
+            DisplayName,
+            Status,
+            StartType,
+            @{Name='Path';Expression={ (Get-WmiObject -Class Win32_Service -Filter "Name='$($_.Name)'" ).PathName }} |
+          Format-Table -AutoSize |
+          Out-String -Width 200
+      register: ppsm_output
+      changed_when: false
+      # ----------------------------------------------------------------
+      # If PPSM is not a service but a registry key, replace the block above
+      # with something like:
+      #
+      #   reg query "HKLM\SOFTWARE\MyCompany\PPSM" /s
+      #
+      # Or, if it’s a PowerShell module, you could use:
+      #
+      #   Get-Module -Name PPSM -ListAvailable | Format-List *
+      # ----------------------------------------------------------------
+
+    # ------------------------------------------------------------
+    # Show the raw result on the console (useful while developing)
+    # ------------------------------------------------------------
+    - name: Debug PPSM raw output for this host
+      debug:
+        var: ppsm_output.stdout_lines
+
+    # ------------------------------------------------------------
+    # Capture a UTC timestamp for this host (used in the final report)
+    # ------------------------------------------------------------
+    - name: Capture UTC timestamp for this host
+      win_shell: |
+        Get-Date -Format "yyyy-MM-dd HH:mm:ss 'UTC'"
+      register: host_timestamp
+      changed_when: false
+
+  # --------------------------------------------------------------
+  # After every host is done, create a single aggregated file on
+  # the control node
+  # --------------------------------------------------------------
+  post_tasks:
+
+    - name: Write aggregated PPSM report to {{ aggregated_file }} on the control node
+      copy:
+        dest: "{{ aggregated_file }}"
+        mode: '0644'
+        content: |
+          {% for h in groups['windows'] %}
+          ### {{ h }} ###
+          Timestamp: {{ hostvars[h]['host_timestamp']['stdout'] | default('N/A') }}
+
+          {{ hostvars[h]['ppsm_output']['stdout'] | default('No PPSM information collected') }}
+
+          {% endfor %}
+      delegate_to: localhost
+      run_once: true               # only one host writes the file
+      changed_when: true
+
+    - name: Show where the aggregated report was written (optional)
+      debug:
+        msg: "Aggregated PPSM report saved to {{ aggregated_file }} on the control node."
+      delegate_to: localhost
+      run_once: true

@@ -1,0 +1,98 @@
+---
+# --------------------------------------------------------------
+# Playbook: clamav_audit.yml
+# Purpose : Run freshclam --version on each host, collect the
+#           engine and signature information, add a UTC timestamp,
+#           and aggregate everything into /tmp/clamav_audit.txt
+#           on the Ansible control node.
+# --------------------------------------------------------------
+
+- name: ClamAV Installation and Signature Audit
+  hosts: all
+  become: true
+  gather_facts: false                         # we collect only what we need
+
+  vars:
+    # Destination file on the control node
+    aggregated_file: /tmp/clamav_audit_{{ now('%Y-%m-%d') }}.txt
+
+  tasks:
+
+    # -----------------------------------------------------------------
+    # 1️⃣  Run freshclam to get version / signature info (do not fail)
+    # -----------------------------------------------------------------
+    - name: Check ClamAV version and signatures
+      ansible.builtin.command: freshclam --version
+      register: freshclam_out
+      changed_when: false
+      failed_when: false   # continue even if ClamAV is missing
+
+    # -----------------------------------------------------------------
+    # 2️⃣  Build a dict with the audit information for this host
+    # -----------------------------------------------------------------
+    - name: Build ClamAV audit facts
+      ansible.builtin.set_fact:
+        clamav_audit:
+          installed: "{{ freshclam_out.rc == 0 }}"
+          engine_version: >-
+            {{
+              freshclam_out.stdout.split('/')[0]
+              if freshclam_out.rc == 0 else 'not installed'
+            }}
+          signature_version: >-
+            {{
+              (freshclam_out.stdout.split('/')[-2] | regex_replace('\\[.*$', ''))
+              if freshclam_out.rc == 0 and '/' in freshclam_out.stdout
+              else 'unknown'
+            }}
+          signature_date: >-
+            {{
+              freshclam_out.stdout.split('/')[-1]
+              if freshclam_out.rc == 0 and '/' in freshclam_out.stdout
+              else 'unknown'
+            }}
+
+    # -----------------------------------------------------------------
+    # 3️⃣  Capture a UTC timestamp for this host (used in the final report)
+    # -----------------------------------------------------------------
+    - name: Capture UTC timestamp for this host
+      ansible.builtin.command: date -u +"%Y-%m-%d %H:%M:%S UTC"
+      register: host_timestamp
+      changed_when: false
+
+    # -----------------------------------------------------------------
+    # 4️⃣  (Optional) Show the audit summary for this host on the console
+    # -----------------------------------------------------------------
+    - name: Show ClamAV audit summary (debug)
+      ansible.builtin.debug:
+        var: clamav_audit
+      when: false   # set to true if you want per‑host console output
+
+  # -----------------------------------------------------------------
+  # 5️⃣  After every host is processed, write a single aggregated file
+  # -----------------------------------------------------------------
+  post_tasks:
+    - name: Write aggregated ClamAV audit report to {{ aggregated_file }} on the control node
+      ansible.builtin.copy:
+        dest: "{{ aggregated_file }}"
+        mode: '0644'
+        content: |
+          {% for host in groups['all'] %}
+          ### {{ host }} ###
+          Timestamp: {{ hostvars[host]['host_timestamp']['stdout'] | default('N/A') }}
+
+          Installed          : {{ hostvars[host]['clamav_audit']['installed'] }}
+          Engine version     : {{ hostvars[host]['clamav_audit']['engine_version'] }}
+          Signature version  : {{ hostvars[host]['clamav_audit']['signature_version'] }}
+          Signature date     : {{ hostvars[host]['clamav_audit']['signature_date'] }}
+
+          {% endfor %}
+      delegate_to: localhost
+      run_once: true               # only one host creates the file
+      changed_when: true
+
+    - name: Inform where the aggregated report is stored
+      ansible.builtin.debug:
+        msg: "Aggregated ClamAV audit saved as {{ aggregated_file }} on the control node."
+      delegate_to: localhost
+      run_once: true

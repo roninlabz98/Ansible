@@ -1,0 +1,93 @@
+---
+# --------------------------------------------------------------
+# Playbook: gather_hardware.yml
+# Purpose : Collect Make / Model / Serial‑Number / OS from every
+#           Linux host and write a single CSV on the control node.
+# --------------------------------------------------------------
+
+- name: Gather hardware inventory from Linux hosts
+  hosts: all                         # limit with -l or an inventory group if needed
+  become: true                       # dmidecode requires root privileges
+  gather_facts: true                 # provides distribution information
+  any_errors_fatal: false            # continue even if a host fails
+
+  vars:
+    # Devices whose serial numbers should be ignored (e.g., placeholder "0")
+    dmidecode_ignore:
+      - "0"
+
+  tasks:
+
+    # ------------------------------------------------------------
+    # Retrieve hardware details via dmidecode
+    # ------------------------------------------------------------
+    - name: Get system manufacturer (Make)
+      ansible.builtin.command: dmidecode -s system-manufacturer
+      register: _make
+      changed_when: false
+      ignore_errors: true
+      tags: hardware
+
+    - name: Get system product name (Model)
+      ansible.builtin.command: dmidecode -s system-product-name
+      register: _model
+      changed_when: false
+      ignore_errors: true
+      tags: hardware
+
+    - name: Get system serial number (SN)
+      ansible.builtin.command: dmidecode -s system-serial-number
+      register: _sn
+      changed_when: false
+      ignore_errors: true
+      tags: hardware
+
+    # ------------------------------------------------------------
+    # Normalise values (fallback to "unknown" when data is missing)
+    # ------------------------------------------------------------
+    - name: Set cleaned‑up hardware facts for this host
+      ansible.builtin.set_fact:
+        hw_make:  "{{ (_make.stdout | default('')) | trim | default('unknown') }}"
+        hw_model: "{{ (_model.stdout | default('')) | trim | default('unknown') }}"
+        hw_sn: >-
+          {{
+            (_sn.stdout | default('')) | trim
+            | reject('in', dmidecode_ignore) | list | first | default('unknown')
+          }}
+        hw_os: "{{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}"
+      tags: set_facts
+
+    # ------------------------------------------------------------
+    # Append a CSV line for this host to a file on the control node
+    # ------------------------------------------------------------
+    - name: Append this host's data to the central CSV (run on control node)
+      delegate_to: localhost
+      become: false
+      run_once: false                     # run once per host, but on localhost
+      ansible.builtin.lineinfile:
+        path: "/tmp/hardware_inventory.csv"
+        create: yes
+        line: "{{ inventory_hostname }},{{ hw_make }},{{ hw_model }},{{ hw_sn }},{{ hw_os }}"
+        insertafter: EOF
+      tags: export
+
+# ----------------------------------------------------------------------
+# Optional second play that prints the aggregated CSV on the control node
+# ----------------------------------------------------------------------
+- name: Show aggregated inventory (control node only)
+  hosts: localhost
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Display the CSV file
+      ansible.builtin.command: cat /tmp/hardware_inventory.csv
+      register: csv_content
+      changed_when: false
+
+    - name: Print CSV content
+      ansible.builtin.debug:
+        msg: |
+          ==============================
+          Hardware inventory collected:
+          ==============================
+          {{ csv_content.stdout }}
